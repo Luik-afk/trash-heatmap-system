@@ -87,3 +87,18 @@ if events_file and bins_file:
 
 else:
     st.info("왼쪽에서 CSV 파일을 업로드하세요.")
+st.markdown("""
+<a href="https://luik-afk.github.io/tlqkf-dumping/dumping_system.html" target="_blank"
+style="
+display:inline-block;
+padding:12px 20px;
+background:#667eea;
+color:white;
+border-radius:8px;
+text-decoration:none;
+font-weight:600;
+">
+🏫 무단투기 분석 시스템 실행
+</a>
+""", unsafe_allow_html=True)
+

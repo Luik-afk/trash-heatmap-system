@@ -1,117 +1,148 @@
 import streamlit as st
 import pandas as pd
-import math
 import numpy as np
+import math
 import folium
 from folium.plugins import HeatMap
-from sklearn.cluster import DBSCAN, KMeans
+from sklearn.cluster import KMeans
+from scipy.spatial import Voronoi
 from streamlit_folium import st_folium
 
-st.set_page_config(page_title="쓰레기 투기 분석 시스템", layout="wide")
-st.title("🗺️ 데이터 기반 쓰레기 분포 분석 시스템")
+# =====================
+# 설정
+# =====================
+st.set_page_config(page_title="쓰레기 투기 NVD 분석", layout="wide")
+st.title("🗺️ 히트맵 기반 쓰레기통 배치 + 보로노이 분석")
 
-# ----------------------
-# 세션 상태 초기화 (핵심)
-# ----------------------
-if "run" not in st.session_state:
-    st.session_state.run = False
+K_FIXED = 55
 
-# ----------------------
-# 파일 업로드
-# ----------------------
-st.sidebar.header("📂 데이터 업로드")
-events_file = st.sidebar.file_uploader("쓰레기 투기 데이터 CSV", type="csv")
-bins_file = st.sidebar.file_uploader("쓰레기통 위치 CSV", type="csv")
+LAT0 = 36 + 21/60 + 52.765/3600
+LON0 = 127 + 21/60 + 13.525/3600
 
-if events_file and bins_file:
-    df_events = pd.read_csv(events_file)
-    df_bins = pd.read_csv(bins_file)
 
-    lat0 = df_events["lat"].mean()
-    lon0 = df_events["lon"].mean()
+# =====================
+# 좌표 변환
+# =====================
+def ll_to_xy(lat, lon):
+    x = (lon - LON0) * 111_000 * math.cos(math.radians(LAT0))
+    y = (lat - LAT0) * 111_000
+    return x, y
 
-    def haversine_m(lat1, lon1, lat2, lon2):
-        R = 6371008.8
-        phi1, phi2 = math.radians(lat1), math.radians(lat2)
-        dphi = math.radians(lat2 - lat1)
-        dl = math.radians(lon2 - lon1)
-        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
-        return 2 * R * math.asin(math.sqrt(a))
+def xy_to_ll(x, y):
+    lon = x / (111_000 * math.cos(math.radians(LAT0))) + LON0
+    lat = y / 111_000 + LAT0
+    return lat, lon
 
-    # ----------------------
-    # 분석 실행 버튼 (눌림 감지용)
-    # ----------------------
+
+# =====================
+# Voronoi 보정
+# =====================
+def voronoi_finite_polygons_2d(vor, radius=8000):
+    new_regions = []
+    new_vertices = vor.vertices.tolist()
+    center = vor.points.mean(axis=0)
+
+    all_ridges = {}
+    for (p1, p2), (v1, v2) in zip(vor.ridge_points, vor.ridge_vertices):
+        all_ridges.setdefault(p1, []).append((p2, v1, v2))
+        all_ridges.setdefault(p2, []).append((p1, v1, v2))
+
+    for p1, region_idx in enumerate(vor.point_region):
+        region = vor.regions[region_idx]
+        if all(v >= 0 for v in region):
+            new_regions.append(region)
+            continue
+
+        new_region = [v for v in region if v >= 0]
+        for p2, v1, v2 in all_ridges[p1]:
+            if v2 < 0:
+                v1, v2 = v2, v1
+            if v1 >= 0:
+                continue
+
+            t = vor.points[p2] - vor.points[p1]
+            t /= np.linalg.norm(t)
+            n = np.array([-t[1], t[0]])
+            midpoint = vor.points[[p1, p2]].mean(axis=0)
+            direction = np.sign(np.dot(midpoint - center, n)) * n
+            far_point = vor.vertices[v2] + direction * radius
+
+            new_vertices.append(far_point.tolist())
+            new_region.append(len(new_vertices) - 1)
+
+        vs = np.asarray([new_vertices[v] for v in new_region])
+        c = vs.mean(axis=0)
+        angles = np.arctan2(vs[:,1]-c[1], vs[:,0]-c[0])
+        new_region = [v for _, v in sorted(zip(angles, new_region))]
+        new_regions.append(new_region)
+
+    return new_regions, np.asarray(new_vertices)
+
+
+# =====================
+# 업로드
+# =====================
+st.sidebar.header("📂 투기 이벤트 CSV 업로드")
+events_file = st.sidebar.file_uploader("event_id, lat, lon, confidence", type="csv")
+
+if events_file:
+    df = pd.read_csv(events_file)
+
+    if "confidence" not in df.columns:
+        df["confidence"] = 1.0
+
+    pts_xy = np.array([ll_to_xy(r.lat, r.lon) for _, r in df.iterrows()])
+    weights = df["confidence"].values
+
     if st.button("🚀 분석 실행"):
-        st.session_state.run = True
 
-    # ----------------------
-    # 분석 결과 출력 (유지됨)
-    # ----------------------
-    if st.session_state.run:
+        # =====================
+        # 1. KMeans (K=55)
+        # =====================
+        km = KMeans(n_clusters=K_FIXED, random_state=1416, n_init=20)
+        km.fit(pts_xy, sample_weight=weights)
+        bins_xy = km.cluster_centers_
 
-        # 1. 히트맵
-        m1 = folium.Map(location=[lat0, lon0], zoom_start=15)
-        heat_data = [[r.lat, r.lon, r.confidence] for _, r in df_events.iterrows()]
-        HeatMap(heat_data, radius=18).add_to(m1)
+        # =====================
+        # 2. Voronoi
+        # =====================
+        vor = Voronoi(bins_xy)
+        regions, vertices = voronoi_finite_polygons_2d(vor)
 
-        st.subheader("🔥 쓰레기 투기 히트맵")
-        st_folium(m1, width=700, height=500)
+        # =====================
+        # 3. 지도 생성
+        # =====================
+        m = folium.Map(location=[LAT0, LON0], zoom_start=15)
 
-        # 2. DBSCAN
-        coords_rad = np.radians(df_events[["lat", "lon"]])
-        db = DBSCAN(
-            eps=(45 / 1000) / 6371,
-            min_samples=10,
-            metric="haversine"
-        ).fit(coords_rad)
+        HeatMap(
+            [[r.lat, r.lon, r.confidence] for _, r in df.iterrows()],
+            radius=18, blur=16, min_opacity=0.3
+        ).add_to(m)
 
-        df_events["cluster"] = db.labels_
+        for i, reg in enumerate(regions):
+            poly = vertices[reg]
+            ll_poly = [xy_to_ll(x, y) for x, y in poly]
 
-        # 3. k-means
-        uncovered = df_events[df_events["cluster"] != -1]
-        if len(uncovered) >= 4:
-            km = KMeans(n_clusters=4, random_state=42, n_init=10)
-            km.fit(uncovered[["lat", "lon"]])
-            centers = km.cluster_centers_
+            folium.Polygon(
+                locations=ll_poly,
+                fill=True,
+                fill_opacity=0.1,
+                weight=1,
+                popup=f"H{i+1}"
+            ).add_to(m)
 
-            m2 = folium.Map(location=[lat0, lon0], zoom_start=15)
+        for i, (x, y) in enumerate(bins_xy, start=1):
+            la, lo = xy_to_ll(x, y)
+            folium.CircleMarker(
+                [la, lo],
+                radius=3,
+                popup=f"H{i}",
+                fill=True,
+                color="red"
+            ).add_to(m)
 
-            for _, r in df_bins.iterrows():
-                folium.CircleMarker(
-                    [r.lat, r.lon],
-                    radius=4,
-                    popup="기존 쓰레기통",
-                    color="blue",
-                    fill=True
-                ).add_to(m2)
-
-            for i, c in enumerate(centers):
-                folium.Marker(
-                    c.tolist(),
-                    popup=f"신규 후보 {i + 1}",
-                    icon=folium.Icon(color="red")
-                ).add_to(m2)
-
-            st.subheader("➕ 신규 쓰레기통 설치 후보")
-            st_folium(m2, width=700, height=500)
+        st.subheader("🧭 히트맵 + Voronoi NVD (K=55)")
+        st_folium(m, width=1200, height=700)
 
 else:
     st.info("왼쪽에서 CSV 파일을 업로드하세요.")
-
-# ----------------------
-# 외부 사이트 링크
-# ----------------------
-st.markdown("""
-<a href="https://luik-afk.github.io/tlqkf-dumping/dumping_system.html" target="_blank"
-style="
-display:inline-block;
-padding:12px 20px;
-background:#667eea;
-color:white;
-border-radius:8px;
-text-decoration:none;
-font-weight:600;
-">
-🏫 무단투기 분석 시스템 실행
-</a>
-""", unsafe_allow_html=True)
